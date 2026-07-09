@@ -791,7 +791,7 @@ def apply_subprocess_home_env(env: dict[str, str]) -> None:
         env["HOME"] = home
 
 
-VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")  # LOCAL PATCH (reasoning-max): 放行 max 档给 Anthropic adaptive 模型(opus 4.7+/fable)，ADAPTIVE_EFFORT_MAP 上游已含 max
 
 
 def parse_reasoning_effort(effort: str) -> dict | None:

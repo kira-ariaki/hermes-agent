@@ -1336,6 +1336,23 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             agent._transport_cache.clear()
         agent._fallback_activated = True
 
+        # LOCAL PATCH (Ariaki 2026-06-12): Fallback reasoning effort override.
+        # A fallback chain entry may specify its own `reasoning_effort` (e.g.
+        # fall back to gpt-5.5 with xhigh thinking even when the global
+        # agent.reasoning_effort is low for the primary). Turn-scoped: the
+        # gateway resets agent.reasoning_config per turn (run.py), so restoring
+        # the primary later automatically reverts to the global value.
+        _fb_effort = (fb.get("reasoning_effort") or "").strip().lower()
+        if _fb_effort:
+            from hermes_constants import parse_reasoning_effort as _parse_re
+            _fb_reasoning = _parse_re(_fb_effort)
+            if _fb_reasoning is not None:
+                agent.reasoning_config = _fb_reasoning
+                logger.info(
+                    "Fallback reasoning effort override: %s → %s",
+                    fb_model, _fb_effort,
+                )
+
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
         # recovery (rate_limit / billing / auth) mutate the wrong credential

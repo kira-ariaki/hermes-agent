@@ -4,10 +4,154 @@ Delegates to the existing adapter functions in agent/anthropic_adapter.py.
 This transport owns format conversion and normalization — NOT client lifecycle.
 """
 
+import json as _json
+import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse
+
+logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────────────────
+# Tool-call-as-text leak ACTIVE RECOVERY (Ariaki local patch, 2026-06-13)
+#
+# Claude (esp. via sub2api / any Anthropic-compat endpoint) intermittently
+# degenerates and writes a tool call as LITERAL antml XML inside a text block
+# instead of emitting a structured tool_use block. The call never executes and
+# the user sees a wall of <function_calls>… markup.
+#
+# Upstream strip_think_blocks only CLEANS this text at the persistence boundary
+# (stops next-turn self-reinforcement) — it does NOT recover the lost call, so
+# the leaking turn still does no work. This recovers it: when a response has NO
+# structured tool_calls but its text matches the leak fingerprint, parse the
+# antml XML back into real ToolCall(s) and strip the leaked markup from content.
+#
+# Verified parser (6/6 cases incl. bare + antml: namespaced + multi-call +
+# special chars + JSON-object params + clean passthrough) — see
+# skill llm-tool-call-emitted-as-text-leak. Both bare <function_calls> and
+# <function_calls> namespaced forms are handled (claude-opus-4-8 emits
+# bare in practice, but namespaced is covered defensively).
+# ──────────────────────────────────────────────────────────────────────────
+_LEAK_PROBE_RE = re.compile(r"<(?:antml:)?(?:function_calls|invoke)\b", re.IGNORECASE)
+_LEAK_BLOCK_RE = re.compile(
+    r"<(?:antml:)?function_calls\b[^>]*>(.*?)</(?:antml:)?function_calls>",
+    re.DOTALL | re.IGNORECASE,
+)
+_LEAK_INVOKE_RE = re.compile(
+    r"<(?:antml:)?invoke\b[^>]*\bname\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</(?:antml:)?invoke>",
+    re.DOTALL | re.IGNORECASE,
+)
+_LEAK_PARAM_RE = re.compile(
+    r"<(?:antml:)?parameter\b[^>]*\bname\s*=\s*[\"']([^\"']+)[\"'][^>]*>(.*?)</(?:antml:)?parameter>",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _coerce_param_value(v: str) -> Any:
+    """Best-effort typing of a parameter value: bool/null/int/float/JSON,
+    otherwise the original string verbatim (commands keep pipes/quotes intact)."""
+    s = v.strip()
+    low = s.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low == "null":
+        return None
+    if re.fullmatch(r"-?\d+", s):
+        try:
+            return int(s)
+        except ValueError:
+            pass
+    if re.fullmatch(r"-?\d*\.\d+", s):
+        try:
+            return float(s)
+        except ValueError:
+            pass
+    if s[:1] in ("{", "["):
+        try:
+            return _json.loads(s)
+        except Exception:
+            pass
+    return v
+
+
+def extract_leaked_tool_calls(text: str):
+    """Parse antml tool-call markup leaked into a text block.
+
+    Returns ``(calls, cleaned_text)`` where ``calls`` is a list of
+    ``{"name", "arguments"(json str)}`` dicts and ``cleaned_text`` has the
+    leaked blocks removed. Returns ``([], text)`` when no leak is present so
+    the common path pays only one cheap regex probe.
+
+    Handles BOTH shapes:
+      1. ``<function_calls><invoke ...>...</invoke></function_calls>`` wrapped
+      2. BARE ``<invoke name="...">...</invoke>`` with NO outer wrapper —
+         this is what the system-prompt example demonstrates, so models
+         degenerate into it more often than the wrapped form. The original
+         patch only matched (1) and silently missed (2). (2026-06-13 fix.)
+    """
+    if not text or not _LEAK_PROBE_RE.search(text):
+        return [], text
+    calls = []
+    spans = []
+
+    # Pass 1: wrapped <function_calls>…</function_calls> blocks.
+    for bm in _LEAK_BLOCK_RE.finditer(text):
+        inner = bm.group(1)
+        for im in _LEAK_INVOKE_RE.finditer(inner):
+            name = im.group(1).strip()
+            if not name:
+                continue
+            params = {}
+            for pm in _LEAK_PARAM_RE.finditer(im.group(2)):
+                params[pm.group(1).strip()] = _coerce_param_value(pm.group(2))
+            calls.append(
+                {"name": name, "arguments": _json.dumps(params, ensure_ascii=False)}
+            )
+        spans.append((bm.start(), bm.end()))
+
+    # Pass 2: BARE <invoke>…</invoke> not already inside a matched block.
+    def _inside_block(s: int, e: int) -> bool:
+        for bs, be in spans:
+            if s >= bs and e <= be:
+                return True
+        return False
+
+    for im in _LEAK_INVOKE_RE.finditer(text):
+        if _inside_block(im.start(), im.end()):
+            continue
+        name = im.group(1).strip()
+        if not name:
+            continue
+        params = {}
+        for pm in _LEAK_PARAM_RE.finditer(im.group(2)):
+            params[pm.group(1).strip()] = _coerce_param_value(pm.group(2))
+        calls.append(
+            {"name": name, "arguments": _json.dumps(params, ensure_ascii=False)}
+        )
+        spans.append((im.start(), im.end()))
+
+    if not calls:
+        return [], text
+    # Merge + sort spans so overlapping/adjacent removals collapse cleanly.
+    spans.sort()
+    merged = []
+    for s, e in spans:
+        if merged and s <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+        else:
+            merged.append((s, e))
+    parts = []
+    cursor = 0
+    for s, e in merged:
+        if cursor < s:
+            parts.append(text[cursor:s])
+        cursor = e
+    if cursor < len(text):
+        parts.append(text[cursor:])
+    cleaned = "".join(parts).strip()
+    return calls, cleaned
 
 
 class AnthropicTransport(ProviderTransport):
@@ -161,6 +305,38 @@ class AnthropicTransport(ProviderTransport):
 
         finish_reason = self._STOP_REASON_MAP.get(response.stop_reason, "stop")
 
+        content_text = "\n".join(text_parts) if text_parts else None
+
+        # ── Tool-call-as-text leak ACTIVE RECOVERY (local patch 2026-06-13) ──
+        # If the model emitted NO structured tool_use but leaked antml tool-call
+        # markup into its text, recover it into real ToolCall(s) and strip the
+        # markup from the visible content. Common path: one cheap regex probe.
+        if not tool_calls and content_text:
+            recovered, cleaned = extract_leaked_tool_calls(content_text)
+            if recovered:
+                for _i, _rc in enumerate(recovered):
+                    _name = _rc["name"]
+                    if strip_tool_prefix and _name.startswith(_MCP_PREFIX):
+                        _stripped = _name[len(_MCP_PREFIX):]
+                        from tools.registry import registry as _tool_registry
+                        if (_tool_registry.get_entry(_stripped)
+                                and not _tool_registry.get_entry(_name)):
+                            _name = _stripped
+                    tool_calls.append(
+                        ToolCall(
+                            id=f"leak_recover_{_i + 1}",
+                            name=_name,
+                            arguments=_rc["arguments"],
+                        )
+                    )
+                content_text = cleaned or None
+                finish_reason = "tool_calls"
+                logger.warning(
+                    "Recovered %d leaked tool call(s) from text block "
+                    "(model emitted antml markup instead of structured tool_use)",
+                    len(recovered),
+                )
+
         provider_data = {}
         if reasoning_details:
             provider_data["reasoning_details"] = reasoning_details
@@ -183,7 +359,7 @@ class AnthropicTransport(ProviderTransport):
             provider_data["anthropic_content_blocks"] = ordered_blocks
 
         return NormalizedResponse(
-            content="\n".join(text_parts) if text_parts else None,
+            content=content_text,
             tool_calls=tool_calls or None,
             finish_reason=finish_reason,
             reasoning="\n\n".join(reasoning_parts) if reasoning_parts else None,

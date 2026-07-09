@@ -235,6 +235,18 @@ def _is_backend_available(backend: str) -> bool:
             return has_xai_credentials()
         except Exception:
             return False
+    # LOCAL PATCH (web-direct-decodo): 自建 provider —— direct 免费 httpx+trafilatura 直拉，decodo 住宅代理 fallback
+    if backend == "decodo":
+        return _has_env("DECODO_BASIC_AUTH_HEADER")
+    if backend == "direct":
+        # Free direct fetch; httpx + trafilatura are hard deps of the plugin.
+        # The Decodo fallback is best-effort and gated separately at call time.
+        try:
+            import httpx  # noqa: F401
+            import trafilatura  # noqa: F401
+        except Exception:  # noqa: BLE001
+            return False
+        return True
     return False
 
 
@@ -863,11 +875,17 @@ async def web_extract_tool(
 def check_web_api_key() -> bool:
     """Check whether the configured web backend is available."""
     configured = _load_web_config().get("backend", "").lower().strip()
-    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai"}:
+    # LOCAL PATCH (web-direct-decodo): direct/decodo 加入 configured 白名单 + auto-detect 兜底
+    if configured in {"exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai", "direct", "decodo"}:
         return _is_backend_available(configured)
+    # per-capability override: extract_backend/search_backend 单独配了也算可用
+    for _cap in ("extract", "search"):
+        _spec = (_load_web_config().get(f"{_cap}_backend") or "").lower().strip()
+        if _spec and _is_backend_available(_spec):
+            return True
     return any(
         _is_backend_available(backend)
-        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai")
+        for backend in ("exa", "parallel", "firecrawl", "tavily", "searxng", "brave-free", "ddgs", "xai", "direct", "decodo")
     )
 
 

@@ -83,7 +83,7 @@ class SearXNGWebSearchProvider(WebSearchProvider):
             resp = httpx.get(
                 f"{base_url}/search",
                 params=params,
-                timeout=15,
+                timeout=25,  # LOCAL PATCH (searxng-timeout): SearXNG 自身 max_request_timeout=15，打平会偶发 ReadTimeout 丢结果
                 headers={"Accept": "application/json"},
             )
             resp.raise_for_status()

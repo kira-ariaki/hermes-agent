@@ -1,0 +1,7 @@
+name: web-direct
+version: 1.0.0
+description: "Direct web extract — free httpx + trafilatura fetch for normal pages, automatic Decodo residential-proxy fallback on anti-bot walls. Extract-only; pair with SearXNG for search."
+author: Ariaki
+kind: backend
+provides_web_providers:
+  - direct

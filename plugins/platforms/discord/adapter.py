@@ -749,7 +749,7 @@ class DiscordAdapter(BasePlatformAdapter):
     # Discord message limits
     MAX_MESSAGE_LENGTH = 2000
     _SPLIT_THRESHOLD = 1900  # near the 2000-char split point
-    supports_code_blocks = True  # Discord markdown renders fenced code blocks natively
+    supports_code_blocks = False  # LOCAL PATCH (no-terminal-codeblocks): Ariaki 嫌工作流里满屏 code block 丑，恢复升级前紧凑单行 terminal 预览。upstream 无开关(PR #41215 硬编码)
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
 
     # Auto-disconnect from voice channel after this many seconds of inactivity
@@ -770,6 +770,9 @@ class DiscordAdapter(BasePlatformAdapter):
         self._text_batch_split_delay_seconds = env_float("HERMES_DISCORD_TEXT_BATCH_SPLIT_DELAY_SECONDS", 2.0)
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        # LOCAL PATCH (discord-smart-thread-title): thread_id → 用户首条消息，
+        # 用于 auto-thread 占位名 → 首条回复后异步 LLM 智能重命名。
+        self._pending_thread_titles: Dict[str, str] = {}
         self._voice_text_channels: Dict[int, int] = {}  # guild_id -> text_channel_id
         self._voice_sources: Dict[int, Dict[str, Any]] = {}  # guild_id -> linked text channel source metadata
         self._voice_timeout_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> timeout task
@@ -1991,6 +1994,13 @@ class DiscordAdapter(BasePlatformAdapter):
                     self._nonconversational_messages.mark_many(message_ids)
                 elif not _looks_like_nonconversational_history_message(content):
                     self._last_self_message_id[_target_id] = message_ids[-1]
+
+            # LOCAL PATCH (discord-smart-thread-title): first bot reply landed
+            # in an auto-created thread → async fire-and-forget smart rename.
+            if thread_id and str(thread_id) in self._pending_thread_titles:
+                asyncio.create_task(
+                    self._maybe_smart_rename_thread(str(thread_id), content)
+                )
 
             return SendResult(
                 success=True,
@@ -3905,7 +3915,7 @@ class DiscordAdapter(BasePlatformAdapter):
             await self._run_simple_slash(interaction, f"/model {name}".strip())
 
         @tree.command(name="reasoning", description="Show or change reasoning effort")
-        @discord.app_commands.describe(effort="Reasoning effort: none, minimal, low, medium, high, or xhigh.")
+        @discord.app_commands.describe(effort="Reasoning effort: none, minimal, low, medium, high, xhigh, or max.")
         async def slash_reasoning(interaction: discord.Interaction, effort: str = ""):
             await self._run_simple_slash(interaction, f"/reasoning {effort}".strip())
 
@@ -5115,6 +5125,7 @@ class DiscordAdapter(BasePlatformAdapter):
         for attempt in range(2):
             try:
                 thread = await message.create_thread(name=thread_name, auto_archive_duration=1440)
+                self._stash_pending_thread_title(thread, content)  # LOCAL PATCH (discord-smart-thread-title)
                 return thread
             except Exception as direct_error:
                 last_direct_error = direct_error
@@ -5127,6 +5138,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         auto_archive_duration=1440,
                         reason=reason,
                     )
+                    self._stash_pending_thread_title(thread, content)  # LOCAL PATCH (discord-smart-thread-title)
                     return thread
                 except Exception as fallback_error:
                     last_fallback_error = fallback_error
@@ -5144,6 +5156,39 @@ class DiscordAdapter(BasePlatformAdapter):
             last_fallback_error,
         )
         return None
+
+    # ── LOCAL PATCH (discord-smart-thread-title) ──────────────────────────
+    # Auto-thread creation happens synchronously on the user message (routing
+    # needs the thread to exist immediately), before any assistant reply, so a
+    # smart title can't be computed yet. Stash the user message keyed by thread
+    # id, then rename once — after the first bot reply lands in send().
+    def _stash_pending_thread_title(self, thread: Any, content: str) -> None:
+        try:
+            tid = str(getattr(thread, "id", "") or "")
+            if tid and content:
+                self._pending_thread_titles[tid] = content
+        except Exception:
+            pass
+
+    async def _maybe_smart_rename_thread(self, thread_id: str, reply_content: str) -> None:
+        """Pop a pending thread and rename it to an LLM-generated title. Best-effort, once."""
+        content = self._pending_thread_titles.pop(thread_id, None)
+        if not content:
+            return
+        try:
+            from agent.title_generator import generate_title
+            title = await asyncio.to_thread(generate_title, content, reply_content or "")
+            if not title:
+                return
+            channel = None
+            if self._client:
+                channel = self._client.get_channel(int(thread_id))
+                if channel is None:
+                    channel = await self._client.fetch_channel(int(thread_id))
+            if channel is not None:
+                await channel.edit(name=title[:100])
+        except Exception as exc:
+            logger.debug("[%s] Smart thread rename failed for %s: %s", self.name, thread_id, exc)
 
     async def create_handoff_thread(
         self,
@@ -5808,7 +5853,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels_raw = os.getenv("DISCORD_NO_THREAD_CHANNELS", "")
             no_thread_channels = {ch.strip() for ch in no_thread_channels_raw.split(",") if ch.strip()}
-            skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
+            skip_thread = bool(channel_keys & no_thread_channels)  # local patch (free_response no longer implies skip_thread)
             auto_thread = os.getenv("DISCORD_AUTO_THREAD", "true").lower() in {"true", "1", "yes"}
             is_reply_message = getattr(message, "type", None) == discord.MessageType.reply
             if auto_thread and not skip_thread and not is_voice_linked_channel and not is_reply_message:
